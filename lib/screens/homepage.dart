@@ -1,21 +1,14 @@
-import 'dart:io';
+import 'dart:typed_data';
 
-import 'package:animated_text_kit/animated_text_kit.dart';
-import 'package:awesome_dialog/awesome_dialog.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_spinkit/flutter_spinkit.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:image_picker/image_picker.dart';
 
-// TODO: แก้ไข path ด้านล่างนี้ให้ตรงกับโปรเจกต์ของคุณ
 import 'package:gpt_vision_leaf_detect/constants/constants.dart';
-import '../services/api_service.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
-import 'package:cross_file/cross_file.dart';
+import 'package:gpt_vision_leaf_detect/services/api_service.dart';
+import 'history_page.dart';
 
-// ----------------------------------------------------------------------
-// Class สำหรับวาดสี่เหลี่ยม (Bounding Box) บนรูปภาพ
-// ----------------------------------------------------------------------
 class BoundingBoxPainter extends CustomPainter {
   final List<double>? box;
 
@@ -26,104 +19,156 @@ class BoundingBoxPainter extends CustomPainter {
     if (box == null || box!.length < 4) return;
 
     final paint = Paint()
-      ..color = Colors.red
+      ..color = accentColor
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 3.5;
+      ..strokeWidth = 4;
 
-    // AI ส่งมาเป็น [ymin, xmin, ymax, xmax] 
-    final double yMin = box![0] * size.height;
-    final double xMin = box![1] * size.width;
-    final double yMax = box![2] * size.height;
-    final double xMax = box![3] * size.width;
+    final yMin = (box![0].clamp(0.0, 1.0)) * size.height;
+    final xMin = (box![1].clamp(0.0, 1.0)) * size.width;
+    final yMax = (box![2].clamp(0.0, 1.0)) * size.height;
+    final xMax = (box![3].clamp(0.0, 1.0)) * size.width;
 
-    final rect = Rect.fromLTRB(xMin, yMin, xMax, yMax);
-    canvas.drawRect(rect, paint);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTRB(xMin, yMin, xMax, yMax),
+        const Radius.circular(12),
+      ),
+      paint,
+    );
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+  bool shouldRepaint(covariant BoundingBoxPainter oldDelegate) {
+    return oldDelegate.box != box;
+  }
 }
 
-// ----------------------------------------------------------------------
-// HomePage
-// ----------------------------------------------------------------------
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
   @override
-  State<HomePage> createState() => _MyHomePageState();
+  State<HomePage> createState() => _HomePageState();
 }
 
-class _MyHomePageState extends State<HomePage> {
-  final apiService = ApiService();
+class _HomePageState extends State<HomePage> {
+  final ApiService apiService = ApiService();
+
   XFile? _selectedImage;
+  Uint8List? _selectedImageBytes;
   String diseaseName = '';
+  String diseaseNameEnglish = '';
+  String diseaseDescription = '';
   String diseasePrecautions = '';
-  List<double> boundingBox = []; // เก็บพิกัดสี่เหลี่ยม
-  
+  double? confidence;
+  List<double> boundingBox = [];
+
   bool detecting = false;
   bool precautionLoading = false;
   bool isSaving = false;
 
   Future<void> _pickImage(ImageSource source) async {
-    final pickedFile =
-        await ImagePicker().pickImage(source: source, imageQuality: 50,maxWidth: 400,          // จำกัดความกว้างไม่เกิน 800 พิกเซล
-      maxHeight: 400);
-    if (pickedFile != null) {
+    try {
+      final pickedFile = await ImagePicker().pickImage(
+        source: source,
+        imageQuality: 90,
+        maxWidth: 1600,
+        maxHeight: 1600,
+      );
+
+      if (pickedFile == null) return;
+
+      final imageBytes = await pickedFile.readAsBytes();
+      if (!mounted) return;
+
       setState(() {
         _selectedImage = pickedFile;
-        // รีเซ็ตค่าทั้งหมดเมื่อเลือกภาพใหม่
+        _selectedImageBytes = imageBytes;
         diseaseName = '';
+        diseaseNameEnglish = '';
+        diseaseDescription = '';
         diseasePrecautions = '';
-        boundingBox = []; 
+        confidence = null;
+        boundingBox = [];
       });
+    } catch (error) {
+      _showErrorSnackBar(error);
     }
   }
 
-  detectDisease() async {
-    setState(() { detecting = true; });
+  Future<void> detectDisease() async {
+    if (_selectedImage == null || detecting) return;
+
+    setState(() {
+      detecting = true;
+    });
+
     try {
-      // เรียกฟังก์ชันเพื่อขอข้อมูล JSON (ชื่อโรค + พิกัดสี่เหลี่ยม)
       final result = await apiService.sendImageToAPI(image: _selectedImage!);
-      
+      if (!mounted) return;
+
+      final rawConfidence = result['confidence'];
       setState(() {
-        diseaseName = result['disease']?.toString() ?? "I don't know";
-        // ดึงพิกัด และแปลงให้เป็น List<double>
-        final rawBox = result['box'] as List<dynamic>? ?? [];
-        boundingBox = rawBox.map((e) => double.tryParse(e.toString()) ?? 0.0).toList();
+        diseaseName = (result['disease_th'] ?? result['disease'] ?? 'ไม่ทราบ')
+            .toString()
+            .trim();
+        diseaseNameEnglish =
+            (result['disease_en'] ?? 'Unknown').toString().trim();
+        diseaseDescription = (result['description_th'] ?? '').toString().trim();
+        confidence = rawConfidence is num
+            ? rawConfidence.toDouble()
+            : double.tryParse(rawConfidence?.toString() ?? '');
+
+        final rawBox = result['box'];
+        boundingBox = rawBox is List
+            ? rawBox.map((e) => double.tryParse(e.toString()) ?? 0.0).toList()
+            : [];
       });
     } catch (error) {
-      _showErrorSnackBar(error);
+      if (mounted) _showErrorSnackBar(error);
     } finally {
-      setState(() { detecting = false; });
+      if (mounted) {
+        setState(() {
+          detecting = false;
+        });
+      }
     }
   }
 
-  showPrecautions() async {
-    setState(() { precautionLoading = true; });
+  Future<void> showPrecautions() async {
+    setState(() {
+      precautionLoading = true;
+    });
+
     try {
-      if (diseasePrecautions == '') {
-        diseasePrecautions =
-            await apiService.sendDiseaseAdvice(diseaseName: diseaseName);
+      if (diseasePrecautions.isEmpty) {
+        diseasePrecautions = await apiService.sendDiseaseAdvice(
+          diseaseName: diseaseName,
+        );
       }
-      _showSuccessDialog("Precautions", diseasePrecautions);
+      if (mounted) _showSuccessDialog('คำแนะนำการดูแล', diseasePrecautions);
     } catch (error) {
-      _showErrorSnackBar(error);
+      if (mounted) _showErrorSnackBar(error);
     } finally {
-      setState(() { precautionLoading = false; });
+      if (mounted) {
+        setState(() {
+          precautionLoading = false;
+        });
+      }
     }
   }
 
   Future<void> _saveDataWithLocation() async {
-    setState(() { isSaving = true; });
+    setState(() {
+      isSaving = true;
+    });
 
     try {
-      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
       if (!serviceEnabled) {
         throw Exception('กรุณาเปิด GPS (Location Services) บนอุปกรณ์ของคุณ');
       }
 
-      LocationPermission permission = await Geolocator.checkPermission();
+      var permission = await Geolocator.checkPermission();
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
         if (permission == LocationPermission.denied) {
@@ -135,136 +180,317 @@ class _MyHomePageState extends State<HomePage> {
         throw Exception('สิทธิ์ถูกปฏิเสธอย่างถาวร กรุณาไปตั้งค่าในเครื่อง');
       }
 
-      Position position = await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.high);
-
-      String latitude = position.latitude.toString();
-      String longitude = position.longitude.toString();
-
-      // TODO: บันทึกลง Database
-      print("Saved: $diseaseName at $latitude, $longitude");
-      
-      _showSuccessDialog(
-        "บันทึกข้อมูลสำเร็จ",
-        "ชื่อโรค: $diseaseName\nพิกัด: $latitude, $longitude",
+      final position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
       );
 
+      if (!mounted) return;
+      _showSuccessDialog(
+        'บันทึกข้อมูลสำเร็จ',
+        'ชื่อโรค: $diseaseName ($diseaseNameEnglish)\n'
+            'พิกัด: ${position.latitude.toStringAsFixed(5)}, '
+            '${position.longitude.toStringAsFixed(5)}',
+      );
     } catch (error) {
-      _showErrorSnackBar(error);
+      if (mounted) _showErrorSnackBar(error);
     } finally {
-      setState(() { isSaving = false; });
+      if (mounted) {
+        setState(() {
+          isSaving = false;
+        });
+      }
     }
   }
 
   void _showErrorSnackBar(Object error) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(error.toString()),
-      backgroundColor: Colors.red,
-      duration: const Duration(seconds: 3),
-    ));
+    final message = error.toString().replaceFirst('Exception: ', '');
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              const Icon(Icons.error_outline, color: Colors.white),
+              const SizedBox(width: 10),
+              Expanded(child: Text(message)),
+            ],
+          ),
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: const Color(0xFFC62828),
+          margin: const EdgeInsets.all(16),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
+          duration: const Duration(seconds: 4),
+        ),
+      );
   }
 
   void _showSuccessDialog(String title, String content) {
-    AwesomeDialog(
+    showDialog<void>(
       context: context,
-      dialogType: DialogType.success,
-      animType: AnimType.rightSlide,
-      title: title,
-      desc: content,
-      btnOkText: 'ตกลง',
-      btnOkColor: themeColor,
-      btnOkOnPress: () {},
-    ).show();
+      builder: (context) {
+        return AlertDialog(
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(28),
+          ),
+          icon: const CircleAvatar(
+            radius: 28,
+            backgroundColor: Color(0xFFE5F5E8),
+            child: Icon(Icons.check_rounded, color: themeColor, size: 34),
+          ),
+          title: Text(title, textAlign: TextAlign.center),
+          content: SingleChildScrollView(
+            child: Text(
+              content,
+              textAlign: TextAlign.center,
+              style: const TextStyle(height: 1.6),
+            ),
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(),
+              style: FilledButton.styleFrom(
+                backgroundColor: themeColor,
+                foregroundColor: textColor,
+              ),
+              child: const Text('ตกลง'),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.grey[50],
       appBar: AppBar(
-        backgroundColor: themeColor,
-        elevation: 0,
-        title: const Text('Plant Disease AI', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        toolbarHeight: 82,
+        titleSpacing: 20,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(bottom: Radius.circular(26)),
+        ),
+        title: Row(
+          children: [
+            Container(
+              width: 46,
+              height: 46,
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.18),
+                borderRadius: BorderRadius.circular(15),
+              ),
+              child: const Icon(Icons.eco_rounded, color: textColor, size: 28),
+            ),
+            const SizedBox(width: 12),
+            const Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  'Plant Disease AI',
+                  style: TextStyle(
+                    color: textColor,
+                    fontWeight: FontWeight.w800,
+                    fontSize: 20,
+                  ),
+                ),
+                SizedBox(height: 2),
+                Text(
+                  'ตรวจโรคพืชด้วย AI',
+                  style: TextStyle(
+                    color: Colors.white70,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.history, color: Colors.white, size: 28),
-            tooltip: 'ประวัติการตรวจ',
+            icon: const Icon(Icons.history_rounded, size: 28),
+            tooltip: 'เปิดประวัติการตรวจ',
             onPressed: () {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('หน้าประวัติ...'))
+              Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => const HistoryPage(),
+                ),
               );
             },
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 10),
         ],
       ),
-      body: Column(
-        children: <Widget>[
-          Stack(
-            children: [
-              Container(
-                height: MediaQuery.of(context).size.height * 0.20,
-                width: double.infinity,
-                decoration: BoxDecoration(
-                  color: themeColor,
-                  borderRadius: const BorderRadius.only(
-                    bottomLeft: Radius.circular(50.0),
+      body: SafeArea(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final contentWidth =
+                constraints.maxWidth > 760 ? 760.0 : constraints.maxWidth;
+
+            return SingleChildScrollView(
+              physics: const BouncingScrollPhysics(),
+              padding: const EdgeInsets.fromLTRB(16, 18, 16, 32),
+              child: Center(
+                child: SizedBox(
+                  width: contentWidth,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      _buildActionPanel(),
+                      const SizedBox(height: 22),
+                      _buildSectionHeading(
+                        'ภาพสำหรับวิเคราะห์',
+                        'เลือกภาพใบพืชที่เห็นอาการชัดเจนที่สุด',
+                      ),
+                      const SizedBox(height: 10),
+                      _buildImagePreview(),
+                      const SizedBox(height: 18),
+                      if (_selectedImage != null && diseaseName.isEmpty)
+                        _buildAnalyzeArea(),
+                      if (diseaseName.isNotEmpty) _buildResultCard(),
+                    ],
                   ),
                 ),
               ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _buildActionPanel() {
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [themeColor, themeColorLight],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(28),
+        boxShadow: [
+          BoxShadow(
+            color: themeColor.withOpacity(0.22),
+            blurRadius: 18,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
               Container(
-                height: MediaQuery.of(context).size.height * 0.18,
-                width: double.infinity,
+                padding: const EdgeInsets.all(10),
                 decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: const BorderRadius.only(
-                    bottomLeft: Radius.circular(50.0),
-                  ),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withOpacity(0.1),
-                      spreadRadius: 1,
-                      blurRadius: 5,
-                      offset: const Offset(2, 2),
+                  color: Colors.white.withOpacity(0.18),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(
+                  Icons.auto_awesome_rounded,
+                  color: textColor,
+                  size: 24,
+                ),
+              ),
+              const SizedBox(width: 12),
+              const Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'เริ่มตรวจสุขภาพพืช',
+                      style: TextStyle(
+                        color: textColor,
+                        fontSize: 19,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    SizedBox(height: 3),
+                    Text(
+                      'วิเคราะห์อาการจากภาพใบพืชได้ง่ายในไม่กี่ขั้นตอน',
+                      style: TextStyle(color: Colors.white70, fontSize: 12),
                     ),
                   ],
                 ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 18),
+          Row(
+            children: [
+              Expanded(
+                child: _buildSourceButton(
+                  icon: Icons.photo_library_rounded,
+                  title: 'เลือกภาพ',
+                  subtitle: 'OPEN GALLERY',
+                  onPressed: () => _pickImage(ImageSource.gallery),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: _buildSourceButton(
+                  icon: Icons.camera_alt_rounded,
+                  title: 'เปิดกล้อง',
+                  subtitle: 'START CAMERA',
+                  onPressed: () => _pickImage(ImageSource.camera),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSourceButton({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required VoidCallback onPressed,
+  }) {
+    return Material(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(18),
+      child: InkWell(
+        onTap: onPressed,
+        borderRadius: BorderRadius.circular(18),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+          child: Row(
+            children: [
+              Container(
+                width: 38,
+                height: 38,
+                decoration: BoxDecoration(
+                  color: appBackgroundColor,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(icon, color: themeColor, size: 22),
+              ),
+              const SizedBox(width: 9),
+              Expanded(
                 child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.center,
-                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                  children: <Widget>[
-                    ElevatedButton(
-                      onPressed: () => _pickImage(ImageSource.gallery),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: themeColor,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Text('OPEN GALLERY', style: TextStyle(color: textColor)),
-                          const SizedBox(width: 10),
-                          Icon(Icons.image, color: textColor)
-                        ],
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        color: inkColor,
+                        fontWeight: FontWeight.w800,
+                        fontSize: 13,
                       ),
                     ),
-                    ElevatedButton(
-                      onPressed: () => _pickImage(ImageSource.camera),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: themeColor,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Text('START CAMERA', style: TextStyle(color: textColor)),
-                          const SizedBox(width: 10),
-                          Icon(Icons.camera_alt, color: textColor)
-                        ],
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle,
+                      style: const TextStyle(
+                        color: mutedTextColor,
+                        fontSize: 9,
+                        letterSpacing: 0.4,
                       ),
                     ),
                   ],
@@ -272,163 +498,381 @@ class _MyHomePageState extends State<HomePage> {
               ),
             ],
           ),
-          
-          // -------------------------------------------------------------
-          // พื้นที่แสดงภาพและวาดกรอบ
-          // -------------------------------------------------------------
-          _selectedImage == null
-              ? Expanded(
-                  child: Center(
-                    child: Padding(
-                      padding: const EdgeInsets.all(40.0),
-                      child: Image.asset(
-                        'assets/images/pick1.png',
-                        fit: BoxFit.contain,
-                      ),
-                    ),
-                  ),
-                )
-              : Expanded(
-                  child: Container(
-                    width: double.infinity,
-                    margin: const EdgeInsets.all(20),
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(20),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withOpacity(0.1),
-                          blurRadius: 10,
-                          offset: const Offset(0, 5),
-                        )
-                      ]
-                    ),
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(20),
-                      child: Stack(
-                        fit: StackFit.expand, // วาง Stack เพื่อซ้อนรูปและเส้น
-                        children: [
-                          kIsWeb
-                          ? Image.network(
-                              _selectedImage!.path,
-                              fit: BoxFit.cover,
-                            )
-                          : Image.file(
-                              File(_selectedImage!.path),
-                              fit: BoxFit.cover,
-                            ),
-                          if (boundingBox.isNotEmpty)
-                            CustomPaint(
-                              painter: BoundingBoxPainter(boundingBox),
-                            ),
-                        ],
-                      ),
-                    ),
-                  ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSectionHeading(String title, String subtitle) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                style: const TextStyle(
+                  color: inkColor,
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
                 ),
-                
-          // ปุ่ม DETECT 
-          if (_selectedImage != null && diseaseName == '')
-            detecting
-                ? Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 20),
-                    child: SpinKitWave(color: themeColor, size: 30),
-                  )
-                : Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 20),
-                    child: ElevatedButton(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: themeColor,
-                        padding: const EdgeInsets.symmetric(vertical: 15),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(15),
-                        ),
-                      ),
-                      onPressed: () => detectDisease(),
-                      child: const Text(
-                        'DETECT',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 16,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                  ),
-                  
-          // ส่วนแสดงผลลัพธ์
-          if (diseaseName != '')
-            Column(
-              children: [
-                Container(
-                  padding: const EdgeInsets.symmetric(vertical: 15, horizontal: 20),
-                  child: DefaultTextStyle(
-                    style: const TextStyle(
-                      color: Colors.black87,
-                      fontWeight: FontWeight.w700,
-                      fontSize: 18,
-                    ),
-                    child: AnimatedTextKit(
-                      isRepeatingAnimation: false,
-                      displayFullTextOnTap: true,
-                      animatedTexts: [
-                        TyperAnimatedText(
-                          diseaseName.trim(),
-                          textAlign: TextAlign.center,
-                        ),
-                      ]
-                    ),
-                  ),
+              ),
+              const SizedBox(height: 3),
+              Text(
+                subtitle,
+                style: const TextStyle(color: mutedTextColor, fontSize: 12),
+              ),
+            ],
+          ),
+        ),
+        const Icon(Icons.eco_rounded, color: themeColorLight, size: 24),
+      ],
+    );
+  }
+
+  Widget _buildImagePreview() {
+    if (_selectedImageBytes == null) {
+      return Container(
+        height: 270,
+        decoration: BoxDecoration(
+          color: cardColor,
+          borderRadius: BorderRadius.circular(24),
+          border: Border.all(color: const Color(0xFFD7E9D9), width: 1.5),
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Container(
+              width: 76,
+              height: 76,
+              decoration: const BoxDecoration(
+                color: appBackgroundColor,
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(
+                Icons.image_search_rounded,
+                color: themeColorLight,
+                size: 40,
+              ),
+            ),
+            const SizedBox(height: 16),
+            const Text(
+              'ยังไม่ได้เลือกภาพ',
+              style: TextStyle(
+                color: inkColor,
+                fontSize: 18,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              'เลือกภาพใบพืชเพื่อเริ่มตรวจ',
+              style: TextStyle(color: mutedTextColor, fontSize: 13),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.black,
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.14),
+            blurRadius: 18,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(24),
+        child: AspectRatio(
+          aspectRatio: 4 / 3,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              Image.memory(
+                _selectedImageBytes!,
+                fit: BoxFit.cover,
+                gaplessPlayback: true,
+              ),
+              if (boundingBox.isNotEmpty)
+                CustomPaint(
+                  painter: BoundingBoxPainter(boundingBox),
                 ),
-                
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 20),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              Positioned(
+                top: 14,
+                left: 14,
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.52),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
                     children: [
-                      Expanded(
-                        child: precautionLoading
-                            ? const SpinKitWave(color: Colors.blue, size: 30)
-                            : ElevatedButton.icon(
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: Colors.blue,
-                                  padding: const EdgeInsets.symmetric(vertical: 15),
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(12),
-                                  ),
-                                ),
-                                onPressed: () => showPrecautions(),
-                                icon: Icon(Icons.info_outline, color: textColor),
-                                label: Text('PRECAUTION',
-                                    style: TextStyle(color: textColor, fontSize: 13)),
-                              ),
-                      ),
-                      
-                      const SizedBox(width: 15),
-                      
-                      Expanded(
-                        child: isSaving
-                            ? SpinKitWave(color: themeColor, size: 30)
-                            : ElevatedButton.icon(
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: Colors.green, 
-                                  padding: const EdgeInsets.symmetric(vertical: 15),
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(12),
-                                  ),
-                                ),
-                                onPressed: () => _saveDataWithLocation(),
-                                icon: Icon(Icons.save, color: textColor),
-                                label: Text('SAVE',
-                                    style: TextStyle(color: textColor, fontSize: 13)),
-                              ),
+                      Icon(Icons.check_circle, color: accentColor, size: 16),
+                      SizedBox(width: 6),
+                      Text(
+                        'ภาพพร้อมวิเคราะห์',
+                        style: TextStyle(
+                          color: textColor,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
                     ],
                   ),
                 ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAnalyzeArea() {
+    if (detecting) {
+      return Container(
+        padding: const EdgeInsets.all(18),
+        decoration: BoxDecoration(
+          color: cardColor,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: const Color(0xFFD7E9D9)),
+        ),
+        child: const Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            SpinKitThreeBounce(color: themeColor, size: 24),
+            SizedBox(width: 14),
+            Text(
+              'กำลังวิเคราะห์ภาพ...',
+              style: TextStyle(
+                color: inkColor,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return SizedBox(
+      height: 58,
+      child: FilledButton.icon(
+        onPressed: detectDisease,
+        icon: const Icon(Icons.auto_awesome_rounded),
+        label: const Text(
+          'เริ่มวิเคราะห์',
+          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+        ),
+        style: FilledButton.styleFrom(
+          backgroundColor: themeColor,
+          foregroundColor: textColor,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(18),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildResultCard() {
+    final confidenceText = confidence == null
+        ? ''
+        : 'ความมั่นใจ ${(confidence!.clamp(0.0, 1.0) * 100).toStringAsFixed(0)}%';
+
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: cardColor,
+        borderRadius: BorderRadius.circular(26),
+        border: Border.all(color: const Color(0xFFB9DDBD), width: 1.5),
+        boxShadow: [
+          BoxShadow(
+            color: themeColor.withOpacity(0.09),
+            blurRadius: 18,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 46,
+                height: 46,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE5F5E8),
+                  borderRadius: BorderRadius.circular(15),
+                ),
+                child: const Icon(
+                  Icons.health_and_safety_rounded,
+                  color: themeColor,
+                  size: 27,
+                ),
+              ),
+              const SizedBox(width: 12),
+              const Expanded(
+                child: Text(
+                  'ผลการวิเคราะห์',
+                  style: TextStyle(
+                    color: inkColor,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE5F5E8),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: const Text(
+                  'ประเมินแล้ว',
+                  style: TextStyle(
+                    color: themeColor,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 18),
+          Text(
+            diseaseName,
+            style: const TextStyle(
+              color: inkColor,
+              fontSize: 26,
+              fontWeight: FontWeight.w900,
+              height: 1.15,
+            ),
+          ),
+          if (diseaseNameEnglish.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Text(
+              diseaseNameEnglish,
+              style: const TextStyle(
+                color: mutedTextColor,
+                fontSize: 14,
+                fontStyle: FontStyle.italic,
+              ),
+            ),
+          ],
+          if (confidenceText.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                const Icon(Icons.insights_rounded,
+                    color: themeColorLight, size: 18),
+                const SizedBox(width: 6),
+                Text(
+                  confidenceText,
+                  style: const TextStyle(
+                    color: themeColor,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
               ],
             ),
-          const SizedBox(height: 30),
+          ],
+          const SizedBox(height: 16),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: appBackgroundColor,
+              borderRadius: BorderRadius.circular(18),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'คำอธิบายอาการ',
+                  style: TextStyle(
+                    color: themeColor,
+                    fontWeight: FontWeight.w800,
+                    fontSize: 14,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  diseaseDescription.isEmpty
+                      ? 'ยังไม่มีคำอธิบายเพิ่มเติมจากระบบ'
+                      : diseaseDescription,
+                  style: const TextStyle(
+                    color: inkColor,
+                    fontSize: 14,
+                    height: 1.55,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 18),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: precautionLoading ? null : showPrecautions,
+                  icon: precautionLoading
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.lightbulb_outline_rounded),
+                  label: const Text('คำแนะนำ'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: themeColor,
+                    side: const BorderSide(color: themeColorLight, width: 1.5),
+                    padding: const EdgeInsets.symmetric(vertical: 15),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(15),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: isSaving ? null : _saveDataWithLocation,
+                  icon: isSaving
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: textColor,
+                          ),
+                        )
+                      : const Icon(Icons.bookmark_add_outlined),
+                  label: const Text('บันทึก'),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: themeColor,
+                    foregroundColor: textColor,
+                    padding: const EdgeInsets.symmetric(vertical: 15),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(15),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
         ],
       ),
     );

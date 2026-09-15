@@ -1,27 +1,118 @@
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:cross_file/cross_file.dart';
 
-// TODO: นำเข้าไฟล์ constants ของคุณ ถ้ามี
-// import '../constants/api_constants.dart';
+import '../constants/api_constants.dart';
+
+Map<String, dynamic> _decodeApiBody(dynamic responseData) {
+  if (responseData == null) {
+    throw StateError('Empty response from API');
+  }
+
+  dynamic decoded = responseData;
+  if (decoded is String) {
+    final trimmed = decoded.trim();
+    if (trimmed.isEmpty) {
+      throw StateError('Empty response from API');
+    }
+
+    try {
+      decoded = jsonDecode(trimmed);
+    } on FormatException {
+      throw StateError(
+        'API returned a non-JSON response: ${_previewText(trimmed)}',
+      );
+    }
+  }
+
+  if (decoded is! Map) {
+    throw StateError('API returned an unexpected response format');
+  }
+
+  return Map<String, dynamic>.from(decoded);
+}
+
+String _previewText(String value) {
+  const maxLength = 300;
+  return value.length <= maxLength
+      ? value
+      : '${value.substring(0, maxLength)}...';
+}
+
+String _apiErrorMessage(dynamic error) {
+  if (error is Map) {
+    return error['message']?.toString() ?? error.toString();
+  }
+  return error.toString();
+}
+
+/// Extracts the assistant text from either a decoded JSON map or a JSON string.
+String extractApiContent(dynamic responseData) {
+  final body = _decodeApiBody(responseData);
+  final error = body['error'];
+  if (error != null) {
+    throw StateError(_apiErrorMessage(error));
+  }
+
+  final choices = body['choices'];
+  if (choices is! List || choices.isEmpty) {
+    throw StateError('No response choices returned');
+  }
+
+  final firstChoice = choices.first;
+  if (firstChoice is! Map) {
+    throw StateError('Invalid response choice returned by API');
+  }
+
+  final message = firstChoice['message'];
+  if (message is! Map) {
+    throw StateError('Invalid message returned by API');
+  }
+
+  final content = message['content'];
+  if (content is String && content.trim().isNotEmpty) {
+    return content.trim();
+  }
+
+  if (content is List) {
+    final text = content
+        .whereType<Map>()
+        .map((part) => part['text'])
+        .whereType<String>()
+        .join()
+        .trim();
+    if (text.isNotEmpty) return text;
+  }
+
+  throw StateError('Empty AI response');
+}
+
+Map<String, dynamic> parseDiseaseAnalysis(String responseText) {
+  final cleanedText =
+      responseText.replaceAll('```json', '').replaceAll('```', '').trim();
+
+  final decoded = jsonDecode(cleanedText);
+  if (decoded is! Map) {
+    throw const FormatException('Disease analysis is not a JSON object');
+  }
+
+  return Map<String, dynamic>.from(decoded);
+}
 
 class ApiService {
   late final Dio _dio;
-  
-  // ⚠️ ใส่ API Key ของคุณที่นี่ (แนะนำให้ใช้ .env ในแอปจริง)
-  final String _apiKey = 'sk_IEPultVWP2jNOvKyaNijkhX0hojpqcoW43eIpCTKAiLUo3J8HWld73sCioBzcPnV'; 
 
   ApiService() {
     _dio = Dio(
       BaseOptions(
-        baseUrl: 'https://gen.ai.kku.ac.th/upacth/api/v1', 
-        connectTimeout: const Duration(seconds: 30), // เผื่อเวลาให้ AI วิเคราะห์ภาพ
+        baseUrl: apiBaseUrl,
+        connectTimeout:
+            const Duration(seconds: 30), // เผื่อเวลาให้ AI วิเคราะห์ภาพ
         receiveTimeout: const Duration(seconds: 30),
         headers: {
-          HttpHeaders.authorizationHeader: 'Bearer $_apiKey',
-          HttpHeaders.contentTypeHeader: 'application/json',
+          'Authorization': 'Bearer $apiKey',
+          'Content-Type': 'application/json',
         },
       ),
     );
@@ -33,54 +124,55 @@ class ApiService {
   }
 
   Future<String> _postToAPI(Map<String, dynamic> data) async {
+    if (apiKey.trim().isEmpty) {
+      throw StateError(
+        'ยังไม่ได้ตั้งค่า API key กรุณารันด้วย --dart-define=UPAI_API_KEY=...',
+      );
+    }
+
     try {
       final response = await _dio.post("/chat/completions", data: data);
-      final jsonResponse = response.data;
-      print(jsonResponse);
-      if (jsonResponse == null) {
-        throw const HttpException('Empty response from API');
-      }
-
-      if (jsonResponse['error'] != null) {
-        throw HttpException(
-          jsonResponse['error']['message']?.toString() ?? 'Unknown API error',
-        );
-      }
-
-      final choices = jsonResponse['choices'];
-      if (choices == null || choices.isEmpty) {
-        throw const HttpException('No response choices returned');
-      }
-
-      final content = choices[0]['message']?['content']?.toString();
-      if (content == null || content.trim().isEmpty) {
-        throw const HttpException('Empty AI response');
-      }
-
-      return content.trim();
+      return extractApiContent(response.data);
     } on DioException catch (e) {
-      final errorMsg = e.response?.data?['error']?['message'] ?? e.message;
-      print("DioException: $errorMsg");
+      final errorMsg = _dioErrorMessage(e);
       throw Exception('API request failed: $errorMsg');
-    } catch (e) {
-      print("General Exception: $e");
-      throw Exception('Error: $e');
     }
+  }
+
+  String _dioErrorMessage(DioException error) {
+    final responseData = error.response?.data;
+    if (responseData != null) {
+      try {
+        final body = _decodeApiBody(responseData);
+        final apiError = body['error'];
+        if (apiError != null) return _apiErrorMessage(apiError);
+        if (body['message'] != null) return body['message'].toString();
+      } on StateError {
+        return _previewText(responseData.toString());
+      }
+    }
+
+    return error.message ?? 'Unknown network error';
   }
 
   Future<String> sendDiseaseAdvice({
     required String diseaseName,
-    String model = "gemini-3.1-pro-preview",
+    String model = defaultModel,
   }) async {
     final data = {
       'model': model,
       'messages': [
         {
+          'role': 'system',
+          'content': 'คุณเป็นผู้เชี่ยวชาญด้านโรคพืชและให้คำแนะนำภาษาไทยเสมอ',
+        },
+        {
           'role': 'user',
-          'content': "For the plant health condition '$diseaseName', "
-              "provide exactly three concise precautionary or management measures IN eng LANGUAGE. "
-              "Each measure must be one short sentence. "
-              "Return only three bullet points and no additional explanation.",
+          'content': "สำหรับอาการของพืช '$diseaseName' "
+              'ให้คำแนะนำการดูแลและป้องกันจำนวน 3 ข้อเป็นภาษาไทยเท่านั้น '
+              'แต่ละข้อเป็นประโยคสั้น กระชับ ปฏิบัติได้จริง '
+              'ให้ขึ้นต้นทุกข้อด้วยเครื่องหมาย - และห้ามใส่คำอธิบายเพิ่มเติม '
+              'หากกล่าวถึงสารเคมี ให้ระบุว่าใช้ตามฉลากและคำแนะนำของหน่วยงานเกษตรในพื้นที่',
         }
       ],
       'max_tokens': 200,
@@ -92,8 +184,8 @@ class ApiService {
   // แก้ไขให้ส่งกลับเป็น Map เพื่อรับค่า JSON (ชื่อโรค + กรอบพิกัด)
   Future<Map<String, dynamic>> sendImageToAPI({
     required XFile image,
-    int maxTokens = 150,
-    String model = "gemini-3.1-pro-preview",
+    int maxTokens = 250,
+    String model = defaultModel,
   }) async {
     final String base64Image = await encodeImage(image);
 
@@ -102,18 +194,29 @@ class ApiService {
       'messages': [
         {
           'role': 'system',
-          'content': 'You are a plant health image analysis assistant.',
+          'content':
+              'You are an expert plant pathologist. Analyze only evidence visible in the image. '
+                  'Be conservative when the image is unclear and never invent a disease.',
         },
         {
           'role': 'user',
           'content': [
             {
               'type': 'text',
-              'text': 'Analyze this image of a plant or leaf. Identify the most likely abnormal condition and provide its name in Thai language. '
-                  'Also, provide the bounding box of the damaged area as normalized coordinates (between 0.0 and 1.0). '
-                  'Respond STRICTLY in valid JSON format like this: {"disease": "ชื่อโรคภาษาไทย", "box": [ymin, xmin, ymax, xmax]}. '
-                  'If no disease is found, set "disease" to "ไม่ทราบ" and "box" to []. '
-                  'Do not use markdown blocks like ```json.',
+              'text':
+                  '''Analyze this plant or leaf image carefully and return ONLY valid JSON.
+
+First, identify the most likely visible condition. It may be a fungal disease, bacterial disease, viral disease, pest damage, nutrient deficiency, or environmental damage. Do not guess from the background or claim certainty when the visible evidence is insufficient.
+
+Return exactly this schema:
+{"disease_th":"ชื่อโรคภาษาไทย","disease_en":"English disease name","description_th":"คำอธิบายอาการที่เห็นเป็นภาษาไทยสั้น ๆ","confidence":0.0,"box":[ymin,xmin,ymax,xmax]}
+
+Rules:
+- Use the common Thai name and the standard English name when possible.
+- confidence must be a number from 0.0 to 1.0 based only on visible evidence.
+- box must cover the main visible symptomatic region and use normalized coordinates from 0.0 to 1.0 in the order [top, left, bottom, right].
+- If the image is not clear enough, use disease_th "ไม่ทราบ", disease_en "Unknown", confidence 0.0, and box [].
+- Do not use Markdown, code fences, extra keys, or explanations outside the JSON.''',
             },
             {
               'type': 'image_url',
@@ -128,15 +231,17 @@ class ApiService {
     };
 
     final responseText = await _postToAPI(data);
-    
+
     try {
-      // ทำความสะอาดข้อความ เผื่อ AI ตอบกลับมามี ```json ติดมาด้วย
-      String cleanedText = responseText.replaceAll('```json', '').replaceAll('```', '').trim();
-      final Map<String, dynamic> jsonMap = jsonDecode(cleanedText);
-      return jsonMap;
+      return parseDiseaseAnalysis(responseText);
     } catch (e) {
-      // หากเกิดข้อผิดพลาดในการแปลง JSON ให้คืนค่าปกติและกล่องเปล่า
-      return {'disease': responseText, 'box': []};
+      return {
+        'disease_th': responseText,
+        'disease_en': 'Unknown',
+        'description_th': 'ไม่สามารถอ่านผลวิเคราะห์เป็น JSON ได้',
+        'confidence': 0.0,
+        'box': [],
+      };
     }
   }
 }
